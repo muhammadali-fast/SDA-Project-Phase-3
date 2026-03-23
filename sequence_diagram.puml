@@ -1,0 +1,143 @@
+@startuml Generic_Concurrent_Pipeline_Sequence_Diagram
+
+!theme cerulean-outline
+skinparam backgroundColor #1e1e2e
+skinparam participantBackgroundColor #2a2a3e
+skinparam participantBorderColor #89b4fa
+skinparam participantFontColor #cdd6f4
+skinparam sequenceArrowColor #cdd6f4
+skinparam sequenceLifeLineBackgroundColor #313244
+skinparam sequenceLifeLineBorderColor #45475a
+skinparam noteBackgroundColor #313244
+skinparam noteBorderColor #f38ba8
+skinparam noteFontColor #cdd6f4
+skinparam title FontColor #cdd6f4
+skinparam sequenceGroupBorderColor #89b4fa
+skinparam sequenceGroupFontColor #a6e3a1
+skinparam sequenceGroupBodyBackgroundColor #1e1e2e
+
+title Generic Concurrent Real-Time Pipeline — Sequence Diagram
+
+actor       "User"                as User
+participant "main.py\n(Orchestrator)"  as Main
+participant "ConfigLoader"        as Cfg
+participant "CSVInputModule\n[Process]"    as Input
+participant "raw_queue\n(bounded)"        as RQ
+participant "CoreWorker × N\n[Processes]" as Workers
+participant "functional_core\n(pure fns)" as FC
+participant "verified_queue\n(bounded)"   as VQ
+participant "Aggregator\n[Process]"       as Agg
+participant "processed_queue\n(bounded)"  as PQ
+participant "Dashboard\n[Process]"        as Dash
+participant "PipelineTelemetry\n[Thread]" as Tel
+
+== Initialisation Phase ==
+
+User  -> Main       : python main.py
+Main  -> Cfg        : ConfigLoader("config.json")
+Cfg  --> Main       : cfg object (all settings)
+Main  -> RQ         : Queue(maxsize=cfg.stream_queue_max_size)
+Main  -> VQ         : Queue(maxsize=cfg.stream_queue_max_size)
+Main  -> PQ         : Queue(maxsize=cfg.stream_queue_max_size)
+
+Main  -> Input      : CSVInputModule(raw_queue, schema, delay, N)
+Main  -> Workers    : CoreWorker × N(raw_queue, verified_queue, key, iters)
+Main  -> Agg        : Aggregator(verified_queue, processed_queue, window, N)
+Main  -> Dash       : Dashboard(processed_queue, chart_configs, telemetry_cfg)
+
+Main  -> Tel        : PipelineTelemetry(raw_queue, processed_queue, max_size)
+Main  -> Tel        : attach(Dashboard)   ← Observer registration
+Main  -> Tel        : start()             ← daemon thread begins polling
+
+Main  -> Dash       : Process.start()
+Main  -> Agg        : Process.start()
+Main  -> Workers    : Process.start() × N
+Main  -> Input      : Process.start()
+
+== Streaming Phase (repeats per CSV row) ==
+
+group Input Process
+    Input -> Input  : open CSV, iterate rows
+    Input -> Input  : _map_row(row) → packet_dict\n[applies schema_mapping + type casting]
+    Input -> RQ     : put(packet_dict)  [BLOCKING if queue full → back-pressure]
+    note right of RQ
+      Back-pressure:
+      If raw_queue is full,
+      put() blocks the Input process
+      automatically.
+    end note
+    Input -> Input  : sleep(input_delay_seconds)
+end
+
+group Core Workers (N processes in parallel)
+    Workers -> RQ   : get(packet_dict)
+    Workers -> FC   : verify_packet(packet_dict, secret_key, iterations)
+    FC      -> FC   : compute_signature(metric_value, key, iters)\n→ pbkdf2_hmac SHA-256
+    FC     --> Workers : is_valid : bool
+
+    alt Signature VALID
+        Workers -> VQ : put(packet_dict)  [ACCEPTED]
+    else Signature INVALID
+        Workers -> Workers : log WARNING and drop packet
+    end
+end
+
+group Aggregator Process (single, stateful)
+    Agg -> VQ       : get(packet_dict)
+    Agg -> Agg      : window.append(metric_value)   ← Imperative Shell
+    Agg -> FC       : compute_running_average(window)\n[Pure function]
+    FC --> Agg      : running_avg : float
+    Agg -> Agg      : packet_dict["computed_metric"] = running_avg
+    Agg -> PQ       : put(enriched_packet_dict)
+end
+
+group Output / Dashboard Process
+    Dash -> PQ      : get_nowait()  [non-blocking, drains queue per frame]
+    Dash -> Dash    : append to times[], values[], avgs[]
+    Dash -> Dash    : line.set_data(times, values/avgs)
+    Dash -> Dash    : ax.relim() + autoscale_view()
+    Dash -> Dash    : plt redraw
+end
+
+== Observer / Telemetry (every poll_interval, daemon thread) ==
+
+loop every 0.5 s
+    Tel  -> RQ      : qsize() → raw_size
+    Tel  -> PQ      : qsize() → proc_size
+    Tel  -> Tel     : _status() → "green" | "yellow" | "red"
+    Tel  -> Dash    : on_telemetry_update({raw_pct, proc_pct, status …})
+    note right of Dash
+      Dashboard stores the snapshot.
+      Next animation frame renders
+      colour-coded progress bars.
+    end note
+end
+
+== Shutdown Phase (poison-pill pattern) ==
+
+Input  -> Input  : EOF reached → loop ends
+loop for each CoreWorker (i = 1..N)
+    Input -> RQ  : put(None)   ← one sentinel per worker
+end
+
+Workers -> RQ    : get() → None  [sentinel received]
+Workers -> VQ    : put(None)     [propagate downstream]
+Workers -> Workers: process exits
+
+note over Agg
+  Aggregator counts sentinels.
+  Waits for ALL N workers to finish.
+end note
+
+Agg -> VQ        : get() → None (×N)
+Agg -> PQ        : put(None)    ← final sentinel to Output
+Agg -> Agg       : process exits
+
+Dash -> PQ       : get_nowait() → None
+Dash -> Dash     : mark pipeline complete, show "✓" title
+
+Main -> Main     : Process.join() for all
+Main -> Tel      : stop()
+Main --> User    : Pipeline finished.
+
+@enduml

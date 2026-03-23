@@ -1,0 +1,265 @@
+@startuml Generic_Concurrent_Pipeline_Class_Diagram
+
+!theme cerulean-outline
+skinparam backgroundColor #1e1e2e
+skinparam classBackgroundColor #2a2a3e
+skinparam classBorderColor #89b4fa
+skinparam classArrowColor #cdd6f4
+skinparam classFontColor #cdd6f4
+skinparam noteBackgroundColor #313244
+skinparam noteBorderColor #89b4fa
+skinparam noteFontColor #cdd6f4
+skinparam packageBackgroundColor #181825
+skinparam packageBorderColor #45475a
+skinparam packageFontColor #a6e3a1
+skinparam title FontColor #cdd6f4
+
+title Generic Concurrent Real-Time Pipeline — Class Diagram
+
+' ======================================================================
+' UTILS PACKAGE
+' ======================================================================
+package "utils" {
+
+  class DataPacket {
+    + entity_name   : str
+    + time_period   : int
+    + metric_value  : float
+    + security_hash : str
+    + computed_metric : float
+    --
+    + to_dict() : Dict
+    + from_dict(d: Dict) : DataPacket
+  }
+
+  abstract class AbstractInputModule {
+    {abstract} + run() : None
+  }
+
+  abstract class AbstractCoreWorker {
+    {abstract} + run() : None
+  }
+
+  abstract class AbstractAggregator {
+    {abstract} + run() : None
+  }
+
+  abstract class AbstractOutputModule {
+    {abstract} + run() : None
+  }
+
+  interface TelemetryObserver {
+    {abstract} + on_telemetry_update(data: Dict) : None
+  }
+
+  interface TelemetrySubject {
+    {abstract} + attach(observer: TelemetryObserver) : None
+    {abstract} + detach(observer: TelemetryObserver) : None
+    {abstract} + notify() : None
+  }
+
+  class ConfigLoader {
+    - _raw : Dict
+    --
+    + dataset_path : str
+    + input_delay_seconds : float
+    + core_parallelism : int
+    + stream_queue_max_size : int
+    + schema_columns : List[Dict]
+    + secret_key : str
+    + hash_iterations : int
+    + window_size : int
+    + telemetry_config : Dict
+    + data_charts : List[Dict]
+    --
+    - _validate() : None
+    + raw() : Dict
+  }
+}
+
+' ======================================================================
+' INPUT MODULE
+' ======================================================================
+package "input_module" {
+
+  class CSVInputModule {
+    - _raw_queue : Queue
+    - _dataset_path : str
+    - _schema_columns : List[Dict]
+    - _input_delay : float
+    - _num_consumers : int
+    --
+    + run() : None
+    - _map_row(row: Dict) : Dict | None
+  }
+
+  note right of CSVInputModule
+    Reads CSV rows,
+    maps columns via schema_mapping,
+    casts types dynamically,
+    pushes DataPacket dicts
+    to raw_queue (blocking put).
+  end note
+}
+
+' ======================================================================
+' CORE MODULE
+' ======================================================================
+package "core_module" {
+
+  class functional_core <<module>> {
+    {static} + compute_signature(val, key, iters) : str
+    {static} + verify_packet(packet, key, iters) : bool
+    {static} + compute_running_average(window) : float
+  }
+
+  note bottom of functional_core
+    Pure functions — no side effects.
+    Safe to call from any process.
+    (Functional Core pattern)
+  end note
+
+  class CoreWorker {
+    - _worker_id : int
+    - _raw_queue : Queue
+    - _verified_queue : Queue
+    - _secret_key : str
+    - _iterations : int
+    --
+    + run() : None
+  }
+
+  note right of CoreWorker
+    Stateless.
+    Runs in N parallel processes.
+    Calls verify_packet() (pure).
+    Drops invalid packets.
+  end note
+
+  class Aggregator {
+    - _verified_queue : Queue
+    - _processed_queue : Queue
+    - _window_size : int
+    - _num_workers : int
+    - _window : deque
+    --
+    + run() : None
+  }
+
+  note right of Aggregator
+    Stateful (sliding window).
+    Single process.
+    Calls compute_running_average()
+    (pure function).
+    Counts sentinels from N workers.
+  end note
+}
+
+' ======================================================================
+' OUTPUT MODULE
+' ======================================================================
+package "output_module" {
+
+  class Dashboard {
+    - _processed_queue : Queue
+    - _chart_configs : List[Dict]
+    - _telemetry_config : Dict
+    - _latest_telemetry : Dict
+    - _times : List[int]
+    - _values : List[float]
+    - _avgs : List[float]
+    --
+    + run() : None
+    + on_telemetry_update(data: Dict) : None
+    - _build_figure() : None
+    - _animate(frame: int) : None
+    - _draw_telemetry() : None
+  }
+
+  note right of Dashboard
+    Observer: implements TelemetryObserver.
+    Renders two real-time line charts
+    + colour-coded telemetry bars.
+    Config-driven — no hardcoded labels.
+  end note
+}
+
+' ======================================================================
+' TELEMETRY PACKAGE
+' ======================================================================
+package "telemetry" {
+
+  class PipelineTelemetry {
+    - _raw_queue : Queue
+    - _processed_queue : Queue
+    - _max_size : int
+    - _poll_interval : float
+    - _observers : List[TelemetryObserver]
+    - _running : bool
+    - _thread : Thread
+    --
+    + attach(observer) : None
+    + detach(observer) : None
+    + notify() : None
+    + start() : None
+    + stop() : None
+    - _poll_loop() : None
+    - _status(size, max) : str
+  }
+
+  note right of PipelineTelemetry
+    Subject in Observer pattern.
+    Polls qsize() in a daemon thread.
+    Classifies health:
+    green / yellow / red.
+  end note
+}
+
+' ======================================================================
+' MAIN ORCHESTRATOR
+' ======================================================================
+package "main" {
+  class Orchestrator <<main.py>> {
+    + main() : None
+  }
+  note right of Orchestrator
+    Creates Queues.
+    Instantiates ALL concrete classes.
+    Injects deps (DIP).
+    Spawns multiprocessing.Process.
+    Wires Observer pattern.
+  end note
+}
+
+' ======================================================================
+' INHERITANCE / IMPLEMENTATION
+' ======================================================================
+CSVInputModule   --|>  AbstractInputModule
+CoreWorker       --|>  AbstractCoreWorker
+Aggregator       --|>  AbstractAggregator
+Dashboard        --|>  AbstractOutputModule
+Dashboard        ..|>  TelemetryObserver
+PipelineTelemetry ..|>  TelemetrySubject
+
+' ======================================================================
+' DEPENDENCIES (usage)
+' ======================================================================
+CSVInputModule   ..>  DataPacket          : creates
+CoreWorker       ..>  functional_core     : calls verify_packet
+Aggregator       ..>  functional_core     : calls compute_running_average
+PipelineTelemetry o--  TelemetryObserver  : notifies (list)
+PipelineTelemetry ..>  Dashboard          : <<notify>>
+
+Orchestrator     ..>  ConfigLoader
+Orchestrator     ..>  CSVInputModule
+Orchestrator     ..>  CoreWorker
+Orchestrator     ..>  Aggregator
+Orchestrator     ..>  Dashboard
+Orchestrator     ..>  PipelineTelemetry
+Orchestrator     ..>  AbstractInputModule   : depends on abstraction
+Orchestrator     ..>  AbstractCoreWorker    : depends on abstraction
+Orchestrator     ..>  AbstractAggregator    : depends on abstraction
+Orchestrator     ..>  AbstractOutputModule  : depends on abstraction
+Orchestrator     ..>  TelemetrySubject      : depends on abstraction
+
+@enduml
